@@ -781,7 +781,7 @@ tr:hover td{background:rgba(0,180,216,.03)}
 .loading-overlay p{font-size:14px;font-weight:600;color:var(--navy)}
 
 /* ── CONFIRM ── */
-.confirm-overlay{position:fixed;inset:0;background:rgba(0,0,0,.5);backdrop-filter:blur(4px);z-index:600;display:flex;align-items:center;justify-content:center;opacity:0;pointer-events:none;transition:opacity var(--trans)}
+.confirm-overlay{position:fixed;inset:0;background:rgba(0,0,0,.5);backdrop-filter:blur(4px);z-index:900;display:flex;align-items:center;justify-content:center;opacity:0;pointer-events:none;transition:opacity var(--trans)}
 .confirm-overlay.open{opacity:1;pointer-events:all}
 .confirm-box{background:#fff;border-radius:16px;padding:28px;max-width:380px;width:calc(100% - 32px);text-align:center;box-shadow:var(--shadow-lg);transform:scale(.9);transition:transform var(--trans)}
 .confirm-overlay.open .confirm-box{transform:scale(1)}
@@ -1874,6 +1874,21 @@ tr:hover td{background:rgba(0,180,216,.03)}
   </div>
 </div>
 
+<!-- Modal: Detail Layanan -->
+<div class="modal-overlay" id="modalLayananDetail">
+  <div class="modal" style="max-width:580px">
+    <div class="modal-header">
+      <div class="modal-title"><i class="fas fa-clipboard-list"></i> Detail Layanan</div>
+      <button class="modal-close" data-close="modalLayananDetail"><i class="fas fa-times"></i></button>
+    </div>
+    <div class="modal-body" id="modalLayananDetailBody"></div>
+    <div class="modal-footer">
+      <button class="btn btn-primary btn-sm" id="btnEditFromDetail"><i class="fas fa-edit"></i> Update Status</button>
+      <button class="btn btn-ghost" data-close="modalLayananDetail">Tutup</button>
+    </div>
+  </div>
+</div>
+
 <!-- ================================================================
      JAVASCRIPT
 ================================================================ -->
@@ -1887,16 +1902,45 @@ const GAS_URL = 'https://script.google.com/macros/s/AKfycbxngbwfiiV5RTeMotel3_Te
 // Contoh: 'https://script.google.com/macros/s/AKfycbxXXXXXXXXX/exec'
 
 // ════════════════════════════════════════
-//  API WRAPPER — pengganti google.script.run
+//  API WRAPPER — robust untuk GAS + CORS
 // ════════════════════════════════════════
 async function api(action, params = {}) {
-  const res = await fetch(GAS_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'text/plain' },
-    body: JSON.stringify({ action, params })
-  });
-  if (!res.ok) throw new Error('HTTP ' + res.status);
-  return res.json();
+  const body = JSON.stringify({ action, params });
+  // AbortController untuk timeout 30 detik — mencegah hanging selamanya
+  const controller = new AbortController();
+  const timeoutId  = setTimeout(() => controller.abort(), 30000);
+  let res;
+  try {
+    res = await fetch(GAS_URL, {
+      method:   'POST',
+      headers:  { 'Content-Type': 'text/plain;charset=UTF-8' },
+      body,
+      redirect: 'follow',
+      signal:   controller.signal,
+    });
+  } catch (networkErr) {
+    clearTimeout(timeoutId);
+    if (networkErr.name === 'AbortError') {
+      throw new Error('Request timeout (30 detik). Periksa koneksi internet atau coba lagi.');
+    }
+    throw new Error('Tidak dapat terhubung ke server: ' + networkErr.message);
+  }
+  clearTimeout(timeoutId);
+  if (!res.ok) {
+    let errText = '';
+    try { errText = await res.text(); } catch(_) {}
+    throw new Error('HTTP ' + res.status + (errText ? ': ' + errText.substring(0, 120) : ''));
+  }
+  const text = await res.text();
+  if (!text || !text.trim()) throw new Error('Respons server kosong');
+  try {
+    return JSON.parse(text);
+  } catch(_) {
+    if (text.includes('<html') || text.includes('<!DOCTYPE')) {
+      throw new Error('Server mengembalikan halaman HTML. Pastikan GAS sudah di-deploy sebagai "Anyone" dan URL sudah benar.');
+    }
+    throw new Error('Gagal parse respons JSON: ' + text.substring(0, 100));
+  }
 }
 
 // ── STATE ──
@@ -1904,6 +1948,7 @@ let currentUser = null;
 let arsipData = [], arsipFiltered = [];
 let userData = [], lpData = [], lpFiltered = [];
 let pubData = [], pubFiltered = [];
+let layananData = [], layananFiltered = [], currentEditLayananId = null;
 let currentEditId = null, currentRejectId = null;
 let selectedFile = null, selectedFileBase64 = null, aiExtractedData = null;
 let confirmCallback = null;
@@ -2239,17 +2284,26 @@ function loadDashboard() {
 //  ARSIP
 // ════════════════════════════════════════
 function loadArsip() {
-  showLoading('Memuat arsip...');
+  const tbody = document.getElementById('arsipTableBody');
+  tbody.innerHTML = `<tr><td colspan="7" class="table-empty"><i class="fas fa-spinner fa-spin" style="font-size:22px;display:block;margin:0 auto 10px"></i>Memuat data arsip...</td></tr>`;
+  document.getElementById('arsipCount').textContent = '...';
+
   api('getArsipList', { userEmail:currentUser.email, userRole:currentUser.role, filter:{} })
     .then(res => {
-      hideLoading();
-      if (!res.success) { toast('error','Gagal',res.message); return; }
-      arsipData     = res.data;
+      if (!res.success) {
+        tbody.innerHTML = `<tr><td colspan="7" class="table-empty"><i class="fas fa-exclamation-triangle" style="font-size:24px;display:block;margin:0 auto 10px;color:var(--danger)"></i>${res.message || 'Gagal memuat data.'}</td></tr>`;
+        toast('error','Gagal Memuat',res.message || 'Terjadi kesalahan pada server.');
+        return;
+      }
+      arsipData     = res.data || [];
       arsipFiltered = [...arsipData];
       arsipPage     = 1;
       renderArsipTable();
     })
-    .catch(err => { hideLoading(); toast('error','Error',err.message); });
+    .catch(err => {
+      tbody.innerHTML = `<tr><td colspan="7" class="table-empty"><i class="fas fa-wifi" style="font-size:24px;display:block;margin:0 auto 10px;color:var(--danger)"></i>Gagal terhubung ke server.<br><small style="color:var(--gray-400)">${err.message}</small></td></tr>`;
+      toast('error','Koneksi Error', err.message);
+    });
 }
 
 function filterArsip() {
@@ -2403,26 +2457,78 @@ function triggerAIExtraction() {
   document.getElementById('aiStatusText').textContent = 'Mengirim ke AI...';
   document.getElementById('aiSpinIcon').className     = 'fas fa-spinner fa-spin';
   document.getElementById('aiResultGrid').innerHTML   = '<div style="grid-column:1/-1;color:var(--teal);font-size:13px"><i class="fas fa-robot"></i> AI sedang membaca dokumen Anda...</div>';
+  document.getElementById('btnApplyAI').style.display = 'none';
 
-  api('extractWithAI', { fileBase64:selectedFileBase64, fileName:selectedFile.name, fileType:selectedFile.type })
+  // Kirim base64 lengkap (dengan prefix data URI); GAS akan membersihkannya sendiri
+  // Untuk file besar > 4MB, kirim hanya nama file agar GAS gunakan filename-fallback
+  const FILE_LIMIT = 4 * 1024 * 1024; // 4MB dalam karakter base64
+  const b64ToSend  = selectedFileBase64.length > FILE_LIMIT
+    ? ''   // terlalu besar, biarkan GAS pakai fallback
+    : selectedFileBase64;
+
+  api('extractWithAI', {
+    fileBase64: b64ToSend,
+    fileName:   selectedFile.name,
+    fileType:   selectedFile.type
+  })
     .then(res => {
-      document.getElementById('aiSpinIcon').className = 'fas fa-robot';
-      if (res.success) {
+      document.getElementById('aiSpinIcon').className = res.success ? 'fas fa-check-circle' : 'fas fa-exclamation-circle';
+      if (res.success && res.data) {
         aiExtractedData = res.data;
-        document.getElementById('aiStatusText').textContent = `✅ Berhasil diekstrak via ${res.source}`;
-        const fields = [['judul','Judul'],['nomorDokumen','Nomor'],['tanggal','Tanggal'],['kategori','Kategori'],['pembuat','Pembuat'],['penerima','Penerima']];
+        const src = res.source || 'AI';
+        document.getElementById('aiStatusText').textContent = `✅ Berhasil diekstrak (${src})`;
+        const fields = [
+          ['judul','Judul'],['nomorDokumen','Nomor'],['tanggal','Tanggal'],
+          ['kategori','Kategori'],['pembuat','Pembuat'],['penerima','Penerima']
+        ];
         document.getElementById('aiResultGrid').innerHTML = fields.map(([k,l]) =>
           `<div class="ai-field"><label>${l}</label><div class="ai-val">${res.data[k]||'—'}</div></div>`).join('');
+        document.getElementById('btnApplyAI').style.display = '';
       } else {
-        document.getElementById('aiStatusText').textContent = '⚠️ ' + res.message;
-        document.getElementById('aiResultGrid').innerHTML = `<div style="grid-column:1/-1;color:var(--warning);font-size:12px">${res.message}</div>`;
+        // Gunakan fallback dari nama file
+        const fallback = buildFallbackFromFilename(selectedFile.name);
+        aiExtractedData = fallback;
+        document.getElementById('aiStatusText').textContent = '⚠️ AI tidak tersedia — menggunakan nama file';
+        document.getElementById('aiSpinIcon').className = 'fas fa-info-circle';
+        const fields = [['judul','Judul'],['kategori','Kategori'],['tanggal','Tanggal']];
+        document.getElementById('aiResultGrid').innerHTML = fields.map(([k,l]) =>
+          `<div class="ai-field"><label>${l}</label><div class="ai-val">${fallback[k]||'—'}</div></div>`).join('') +
+          `<div style="grid-column:1/-1;color:var(--gray-400);font-size:12px;margin-top:4px"><i class="fas fa-info-circle"></i> Silakan lengkapi form secara manual.</div>`;
+        document.getElementById('btnApplyAI').style.display = '';
       }
     })
     .catch(err => {
-      document.getElementById('aiSpinIcon').className = 'fas fa-robot';
-      document.getElementById('aiStatusText').textContent = '❌ Gagal menghubungi AI';
-      document.getElementById('aiResultGrid').innerHTML = `<div style="grid-column:1/-1;color:var(--danger);font-size:12px">${err.message}</div>`;
+      // Network error — tetap gunakan fallback dari nama file
+      const fallback = buildFallbackFromFilename(selectedFile.name);
+      aiExtractedData = fallback;
+      document.getElementById('aiSpinIcon').className = 'fas fa-info-circle';
+      document.getElementById('aiStatusText').textContent = '⚠️ Koneksi AI gagal — menggunakan nama file';
+      const fields = [['judul','Judul'],['kategori','Kategori'],['tanggal','Tanggal']];
+      document.getElementById('aiResultGrid').innerHTML = fields.map(([k,l]) =>
+        `<div class="ai-field"><label>${l}</label><div class="ai-val">${fallback[k]||'—'}</div></div>`).join('') +
+        `<div style="grid-column:1/-1;color:var(--gray-400);font-size:12px;margin-top:4px">${err.message}</div>`;
+      document.getElementById('btnApplyAI').style.display = '';
     });
+}
+
+/** Fallback lokal (tanpa API) — ekstrak info dari nama file */
+function buildFallbackFromFilename(fileName) {
+  const date = new Date().toISOString().split('T')[0];
+  const fn   = (fileName || '').toLowerCase();
+  let kategori = 'Lainnya';
+  if (/surat\s*keputusan|\bsk\b/.test(fn))               kategori = 'SK';
+  else if (/surat.*masuk|masuk/.test(fn))                 kategori = 'Surat Masuk';
+  else if (/surat.*keluar|keluar/.test(fn))               kategori = 'Surat Keluar';
+  else if (/laporan/.test(fn))                            kategori = 'Laporan';
+  else if (/keuangan/.test(fn))                           kategori = 'Keuangan';
+  else if (/kepegawaian|pegawai/.test(fn))                kategori = 'Kepegawaian';
+  else if (/peraturan/.test(fn))                          kategori = 'Peraturan';
+  const judul = (fileName || 'Dokumen Tanpa Judul')
+    .replace(/\.[^/.]+$/, '').replace(/[-_]/g, ' ')
+    .replace(/\b\w/g, c => c.toUpperCase());
+  return { judul, nomorDokumen:'', tanggal:date, pembuat:'', penerima:'',
+           isiDisposisi:'', lokasiFisik:'', kategori,
+           keterangan:'Harap lengkapi data secara manual.' };
 }
 
 function applyAIResult() {
@@ -2471,24 +2577,56 @@ function submitArsip() {
   const kat     = document.getElementById('fKategori').value;
   if (!judul)   { toast('warning','Wajib Diisi','Judul dokumen tidak boleh kosong.'); return; }
   if (!tanggal) { toast('warning','Wajib Diisi','Tanggal dokumen tidak boleh kosong.'); return; }
-  if (!kat)     { toast('warning','Wajib Diisi','Kategori wajib dipilih.'); return; }
+  if (!kat || kat === '')  { toast('warning','Wajib Diisi','Kategori wajib dipilih.'); return; }
+
   const payload = {
-    judul, tanggal, nomorDokumen:document.getElementById('fNomor').value.trim(),
-    pembuat:document.getElementById('fPembuat').value.trim(), penerima:document.getElementById('fPenerima').value.trim(),
-    isiDisposisi:document.getElementById('fDisposisi').value.trim(), lokasiFisik:document.getElementById('fLokasi').value.trim(),
-    kategori:kat, status:document.getElementById('fStatus').value, keterangan:document.getElementById('fKeterangan').value.trim(),
+    judul, tanggal,
+    nomorDokumen:   document.getElementById('fNomor').value.trim(),
+    pembuat:        document.getElementById('fPembuat').value.trim(),
+    penerima:       document.getElementById('fPenerima').value.trim(),
+    isiDisposisi:   document.getElementById('fDisposisi').value.trim(),
+    lokasiFisik:    document.getElementById('fLokasi').value.trim(),
+    kategori:       kat,
+    status:         document.getElementById('fStatus').value,
+    keterangan:     document.getElementById('fKeterangan').value.trim(),
   };
-  showLoading(currentEditId ? 'Memperbarui arsip...' : 'Menyimpan arsip...');
+
+  // Tutup modal DULU, baru tampilkan loading
   closeModal('modalArsip');
+  setTimeout(() => showLoading(currentEditId ? 'Memperbarui arsip...' : 'Menyimpan arsip...'), 50);
 
   const action = currentEditId ? 'updateArsip' : 'saveArsip';
   const params = currentEditId
-    ? { id:currentEditId, arsipData:payload, fileBase64:selectedFileBase64, fileName:selectedFile?.name, fileType:selectedFile?.type, userEmail:currentUser.email, userName:currentUser.nama, userRole:currentUser.role }
-    : { arsipData:payload, fileBase64:selectedFileBase64, fileName:selectedFile?.name, fileType:selectedFile?.type, userEmail:currentUser.email, userName:currentUser.nama, userRole:currentUser.role };
+    ? {
+        id: currentEditId, arsipData: payload,
+        fileBase64: selectedFileBase64 || null,
+        fileName:   selectedFile ? selectedFile.name : null,
+        fileType:   selectedFile ? selectedFile.type : null,
+        userEmail: currentUser.email, userName: currentUser.nama, userRole: currentUser.role
+      }
+    : {
+        arsipData: payload,
+        fileBase64: selectedFileBase64 || null,
+        fileName:   selectedFile ? selectedFile.name : null,
+        fileType:   selectedFile ? selectedFile.type : null,
+        userEmail: currentUser.email, userName: currentUser.nama, userRole: currentUser.role
+      };
 
   api(action, params)
-    .then(res => { hideLoading(); if (res.success) { toast('success','Berhasil',res.message); loadArsip(); loadDashboard(); } else toast('error','Gagal',res.message); })
-    .catch(err => { hideLoading(); toast('error','Error',err.message); });
+    .then(res => {
+      hideLoading();
+      if (res.success) {
+        toast('success', 'Berhasil', res.message || 'Arsip berhasil disimpan.');
+        loadArsip();
+        loadDashboard();
+      } else {
+        toast('error', 'Gagal', res.message || 'Terjadi kesalahan.');
+      }
+    })
+    .catch(err => {
+      hideLoading();
+      toast('error', 'Error Koneksi', err.message);
+    });
 }
 
 function confirmDeleteArsip(id) {
@@ -2515,12 +2653,36 @@ function previewFile(fileId) {
 
 // ── APPROVAL ──
 function loadApproval() {
+  const c = document.getElementById('approvalList');
+  // Tampilkan loading dulu sebelum fetch
+  c.innerHTML = `<div style="text-align:center;padding:60px;color:var(--gray-400)">
+    <i class="fas fa-spinner fa-spin" style="font-size:36px;display:block;margin-bottom:16px;color:var(--teal)"></i>
+    <p style="font-size:14px;font-weight:600">Memuat daftar persetujuan...</p>
+  </div>`;
+
   api('getArsipList', { userEmail:currentUser.email, userRole:currentUser.role, filter:{} })
     .then(res => {
-      if (!res.success) { toast('error','Gagal',res.message); return; }
-      const pending = res.data.filter(a => a['Status']==='Menunggu Approval');
-      const c = document.getElementById('approvalList');
-      if (!pending.length) { c.innerHTML=`<div style="text-align:center;padding:60px;color:var(--gray-400)"><i class="fas fa-check-circle" style="font-size:48px;color:var(--success);display:block;margin-bottom:16px"></i><h3>Semua Sudah Diproses!</h3><p>Tidak ada dokumen menunggu persetujuan.</p></div>`; return; }
+      if (!res.success) {
+        c.innerHTML = `<div style="text-align:center;padding:48px;color:var(--danger)"><i class="fas fa-exclamation-circle" style="font-size:32px;display:block;margin-bottom:12px"></i><p>${res.message || 'Gagal memuat data.'}</p></div>`;
+        toast('error','Gagal',res.message);
+        return;
+      }
+      const pending = (res.data || []).filter(a => a['Status']==='Menunggu Approval');
+      if (!pending.length) {
+        c.innerHTML = `<div style="text-align:center;padding:60px;color:var(--gray-400)">
+          <i class="fas fa-check-circle" style="font-size:48px;color:var(--success);display:block;margin-bottom:16px"></i>
+          <h3 style="margin-bottom:8px">Semua Sudah Diproses!</h3>
+          <p>Tidak ada dokumen yang menunggu persetujuan.</p>
+        </div>`;
+        // Update badge notif
+        const badge = document.getElementById('approvalBadge');
+        if (badge) { badge.style.display='none'; document.getElementById('notifBtn').classList.remove('has-badge'); }
+        return;
+      }
+      // Update badge
+      const badge = document.getElementById('approvalBadge');
+      if (badge) { badge.style.display=''; badge.textContent=pending.length; document.getElementById('notifBtn').classList.add('has-badge'); }
+
       c.innerHTML = pending.map(a => `
         <div class="approval-card anim-fade-up">
           <div class="approval-icon"><i class="fas fa-file-alt"></i></div>
@@ -2543,15 +2705,48 @@ function loadApproval() {
       c.querySelectorAll('[data-approve]').forEach(btn => btn.addEventListener('click', () => doApprove(btn.dataset.approve)));
       c.querySelectorAll('[data-reject]').forEach(btn => btn.addEventListener('click', () => openReject(btn.dataset.reject)));
     })
-    .catch(err => toast('error','Error',err.message));
+    .catch(err => {
+      c.innerHTML = `<div style="text-align:center;padding:48px;color:var(--danger)">
+        <i class="fas fa-wifi" style="font-size:32px;display:block;margin-bottom:12px"></i>
+        <p>Gagal terhubung ke server.<br><small style="color:var(--gray-400)">${err.message}</small></p>
+      </div>`;
+    });
 }
 
 function doApprove(id) {
-  showConfirm('✅','Setujui Publikasi','Dokumen akan dipublikasikan dan dapat diakses publik.','Setujui','btn-success', () => {
-    showLoading('Menyetujui...');
-    api('approveArsip', { id, userEmail:currentUser.email, userName:currentUser.nama })
-      .then(res => { hideLoading(); if (res.success) { toast('success','Disetujui',res.message); loadApproval(); loadDashboard(); } else toast('error','Gagal',res.message); })
-      .catch(err => { hideLoading(); toast('error','Error',err.message); });
+  showConfirm('✅','Setujui Publikasi','Dokumen akan dipublikasikan dan dapat diakses publik.','Setujui','btn-success', function() {
+    // Disable semua tombol approval agar tidak double-click
+    document.querySelectorAll('[data-approve],[data-reject]').forEach(function(b) { b.disabled = true; });
+    // Ubah kartu yang bersangkutan menjadi loading state
+    var btn = document.querySelector('[data-approve="' + id + '"]');
+    if (btn) {
+      var card = btn.closest('.approval-card');
+      if (card) {
+        card.style.opacity = '0.6';
+        card.style.pointerEvents = 'none';
+        btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Menyetujui...';
+      }
+    }
+    // Tampilkan loading overlay
+    showLoading('Menyetujui dan mempublikasikan dokumen...');
+
+    api('approveArsip', { id: id, userEmail: currentUser.email, userName: currentUser.nama })
+      .then(function(res) {
+        hideLoading();
+        if (res.success) {
+          toast('success', 'Berhasil Dipublikasikan', res.message || 'Dokumen berhasil dipublikasikan ke portal publik.');
+          loadApproval();
+          loadDashboard();
+        } else {
+          toast('error', 'Gagal Menyetujui', res.message || 'Terjadi kesalahan. Coba lagi.');
+          loadApproval();
+        }
+      })
+      .catch(function(err) {
+        hideLoading();
+        toast('error', 'Error Koneksi', err.message);
+        loadApproval();
+      });
   });
 }
 
@@ -2560,10 +2755,21 @@ function openReject(id) { currentRejectId=id; document.getElementById('rejectAla
 function submitReject() {
   const alasan = document.getElementById('rejectAlasan').value.trim();
   if (!alasan) { toast('warning','Wajib','Alasan penolakan harus diisi.'); return; }
-  closeModal('modalReject'); showLoading('Menolak...');
+  closeModal('modalReject');
+  showLoading('Menolak dokumen...');
   api('rejectArsip', { id:currentRejectId, alasan, userEmail:currentUser.email, userName:currentUser.nama })
-    .then(res => { hideLoading(); if (res.success) { toast('warning','Ditolak',res.message); loadApproval(); loadDashboard(); } else toast('error','Gagal',res.message); })
-    .catch(err => { hideLoading(); toast('error','Error',err.message); });
+    .then(function(res) {
+      hideLoading();
+      if (res.success) {
+        toast('warning', 'Dokumen Ditolak', res.message || 'Dokumen berhasil ditolak.');
+        loadApproval();
+        loadDashboard();
+      } else {
+        toast('error','Gagal',res.message);
+        loadApproval();
+      }
+    })
+    .catch(function(err) { hideLoading(); toast('error','Error',err.message); loadApproval(); });
 }
 
 // ── USERS ──
@@ -2617,7 +2823,8 @@ function submitUser() {
   const email = document.getElementById('uEmail').value.trim();
   if (!nama||!email) { toast('warning','Wajib Diisi','Nama dan email tidak boleh kosong.'); return; }
   const payload = { nama, email, password:document.getElementById('uPass').value, role:document.getElementById('uRole').value, aktif:document.getElementById('uAktif').value==='true' };
-  showLoading('Menyimpan data pengguna...'); closeModal('modalUser');
+  closeModal('modalUser');
+  setTimeout(() => showLoading('Menyimpan data pengguna...'), 50);
   const action = currentEditId ? 'updateUser' : 'saveUser';
   const params = currentEditId
     ? { id:currentEditId, userData:payload, userEmail:currentUser.email, userName:currentUser.nama }
@@ -2733,7 +2940,6 @@ function viewDetailPub(id) {
 // ════════════════════════════════════════
 //  LAYANAN PUBLIK
 // ════════════════════════════════════════
-let layananData = [], layananFiltered = [], currentEditLayananId = null;
 
 function scrollToTracking() {
   showScreen('landing');
@@ -2887,6 +3093,11 @@ function viewLayanan(id) {
       <div><div style="font-size:11px;font-weight:700;color:var(--gray-400);text-transform:uppercase;letter-spacing:.5px">Tanggal Masuk</div><div style="margin-top:4px">${formatDate(l['Tanggal Masuk'])}</div></div>
       <div><div style="font-size:11px;font-weight:700;color:var(--gray-400);text-transform:uppercase;letter-spacing:.5px">Petugas</div><div style="margin-top:4px">${l['Petugas']||'—'}</div></div>
     </div>`;
+  // Wire up the edit button
+  const btnEdit = document.getElementById('btnEditFromDetail');
+  if (btnEdit) {
+    btnEdit.onclick = () => { closeModal('modalLayananDetail'); openLayananModal(l['ID']); };
+  }
   openModal('modalLayananDetail');
 }
 
@@ -2928,8 +3139,8 @@ function submitLayanan() {
     jenisLayanan:          jenis,
     keteranganPermohonan:  document.getElementById('lKeterangan').value.trim(),
   };
-  showLoading('Menyimpan layanan...');
   closeModal('modalLayanan');
+  setTimeout(() => showLoading('Menyimpan layanan...'), 50);
 
   if (currentEditLayananId) {
     const updateData = { ...payload, status:document.getElementById('lStatus').value, catatanPetugas:document.getElementById('lCatatan').value.trim() };
